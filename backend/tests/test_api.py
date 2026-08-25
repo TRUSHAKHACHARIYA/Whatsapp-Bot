@@ -2,7 +2,6 @@
 Production test suite for WapiSend backend.
 Run: pytest tests/ -v
 """
-import asyncio
 import pytest
 import uuid
 from httpx import AsyncClient, ASGITransport
@@ -33,13 +32,6 @@ async def override_get_db():
 
 
 app.dependency_overrides[get_db] = override_get_db
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
 
 
 @pytest.fixture(scope="session", autouse=True)

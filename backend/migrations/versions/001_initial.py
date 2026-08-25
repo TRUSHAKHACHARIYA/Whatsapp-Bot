@@ -240,9 +240,19 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now()),
     )
 
+    # messages.campaign_id links outbound broadcast messages back to their
+    # campaign so delivery/read status updates from the webhook can roll up
+    # into Campaign.delivered_count / read_count / failed_count.
+    op.add_column(
+        "messages",
+        sa.Column("campaign_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("campaigns.id"), nullable=True),
+    )
+
     # Indexes for performance
     op.create_index("ix_messages_conversation_id", "messages", ["conversation_id"])
     op.create_index("ix_messages_tenant_id_created_at", "messages", ["tenant_id", "created_at"])
+    op.create_index("ix_messages_wa_message_id", "messages", ["wa_message_id"])
+    op.create_index("ix_messages_campaign_id", "messages", ["campaign_id"])
     op.create_index("ix_conversations_tenant_id_last_message", "conversations", ["tenant_id", "last_message_at"])
     op.create_index("ix_leads_tenant_id_stage", "leads", ["tenant_id", "stage"])
     op.create_index("ix_contacts_tenant_id_phone", "contacts", ["tenant_id", "phone"])
@@ -250,6 +260,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.drop_column("messages", "campaign_id")
     op.drop_table("campaigns")
     op.drop_table("leads")
     op.drop_table("form_responses")

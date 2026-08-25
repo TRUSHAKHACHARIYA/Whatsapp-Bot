@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.database.session import get_db
 from app.database.models import (
-    WhatsAppAccount, Contact, Conversation, Message,
+    WhatsAppAccount, Contact, Conversation, Message, Campaign,
     ConversationStatus, MessageDirection, MessageStatus
 )
 from app.auth.dependencies import get_current_user, require_admin_or_owner
@@ -199,6 +199,23 @@ async def handle_status_update(status_update: dict, db: AsyncSession):
         msg = result.scalar_one_or_none()
         if msg:
             msg.status = status_map[new_status]
+            if msg.campaign_id:
+                await bump_campaign_status_count(msg.campaign_id, status_map[new_status], db)
+
+
+async def bump_campaign_status_count(campaign_id, status: MessageStatus, db: AsyncSession):
+    """Roll a delivery-status webhook update up into the campaign's counters."""
+    field = {
+        MessageStatus.DELIVERED: "delivered_count",
+        MessageStatus.READ: "read_count",
+        MessageStatus.FAILED: "failed_count",
+    }.get(status)
+    if not field:
+        return
+    campaign = await db.get(Campaign, campaign_id)
+    if not campaign:
+        return
+    setattr(campaign, field, (getattr(campaign, field) or 0) + 1)
 
 
 # ─── Send message API ─────────────────────────────────────────────────────────
