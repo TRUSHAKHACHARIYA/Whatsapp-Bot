@@ -48,7 +48,7 @@ async def process_message(
 
     flow_data = flow.flow_data or {}
     nodes = flow_data.get("nodes", [])
-    current_node_id = conversation.metadata.get("current_node_id") if conversation.metadata else None
+    current_node_id = conversation.extra_data.get("current_node_id") if conversation.extra_data else None
 
     # Check for FAQ match first (higher priority than menu)
     faq_answer = await match_faq(content_lower, wa_account.tenant_id, db)
@@ -252,9 +252,9 @@ def format_menu_text(menu_node: dict) -> str:
 
 
 def update_conversation_node(conversation: Conversation, node_id: str):
-    meta = conversation.metadata or {}
+    meta = conversation.extra_data or {}
     meta["current_node_id"] = node_id
-    conversation.metadata = meta
+    conversation.extra_data = meta
 
 
 async def save_outbound_message(

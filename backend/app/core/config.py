@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     # WhatsApp / Meta
     WHATSAPP_API_URL: str = "https://graph.facebook.com/v19.0"
     WHATSAPP_VERIFY_TOKEN: str = "wapisend_webhook_verify_token"
+    WHATSAPP_APP_SECRET: str = ""
 
     # Razorpay
     RAZORPAY_KEY_ID: str = ""

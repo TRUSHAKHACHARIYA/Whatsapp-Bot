@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -18,6 +19,7 @@ from app.auth.dependencies import get_current_user, require_admin_or_owner
 from app.database.models import User
 
 router = APIRouter(prefix="/whatsapp", tags=["whatsapp"])
+logger = logging.getLogger(__name__)
 
 
 # ─── Webhook verification ─────────────────────────────────────────────────────
@@ -28,9 +30,32 @@ async def verify_webhook(
     hub_verify_token: str = Query(alias="hub.verify_token"),
     hub_challenge: str = Query(alias="hub.challenge"),
 ):
-    if hub_mode == "subscribe" and hub_verify_token == settings.WHATSAPP_VERIFY_TOKEN:
-        return int(hub_challenge)
+    if hub_mode == "subscribe" and hmac.compare_digest(hub_verify_token, settings.WHATSAPP_VERIFY_TOKEN):
+        try:
+            return int(hub_challenge)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Verification failed.")
     raise HTTPException(status_code=403, detail="Verification failed.")
+
+
+def verify_webhook_signature(body: bytes, signature_header: str) -> bool:
+    """Verify Meta's X-Hub-Signature-256 HMAC over the raw request body."""
+    if not settings.WHATSAPP_APP_SECRET:
+        # No app secret configured — only tolerated outside production. Fail closed otherwise.
+        if settings.DEBUG:
+            logger.warning("WHATSAPP_APP_SECRET is not set; skipping webhook signature verification (DEBUG mode).")
+            return True
+        logger.error("WHATSAPP_APP_SECRET is not set; rejecting webhook.")
+        return False
+
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+
+    expected = hmac.new(
+        settings.WHATSAPP_APP_SECRET.encode(), body, hashlib.sha256
+    ).hexdigest()
+    received = signature_header.removeprefix("sha256=")
+    return hmac.compare_digest(expected, received)
 
 
 # ─── Webhook receiver ─────────────────────────────────────────────────────────
@@ -39,9 +64,9 @@ async def verify_webhook(
 async def receive_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     body = await request.body()
 
-    # Signature verification
     signature = request.headers.get("X-Hub-Signature-256", "")
-    # In production, verify against app secret
+    if not verify_webhook_signature(body, signature):
+        raise HTTPException(status_code=403, detail="Invalid webhook signature.")
 
     payload = json.loads(body)
     await process_webhook_payload(payload, db)
