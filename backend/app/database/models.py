@@ -196,7 +196,7 @@ class Conversation(Base, TimestampMixin):
     last_message_preview = Column(String(255))
     unread_count = Column(Integer, default=0)
     bot_active = Column(Boolean, default=True)
-    metadata = Column(JSON, default={})
+    extra_data = Column("metadata", JSON, default={})
 
     tenant = relationship("Tenant", back_populates="conversations")
     contact = relationship("Contact", back_populates="conversations")
@@ -220,9 +220,11 @@ class Message(Base, TimestampMixin):
     wa_message_id = Column(String(255))  # WhatsApp message ID for status tracking
     is_internal_note = Column(Boolean, default=False)
     sent_by_agent_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
-    metadata = Column(JSON, default={})
+    campaign_id = Column(UUID(as_uuid=True), ForeignKey("campaigns.id"), nullable=True)
+    extra_data = Column("metadata", JSON, default={})
 
     conversation = relationship("Conversation", back_populates="messages")
+    campaign = relationship("Campaign", back_populates="messages")
 
 
 # ─── Bot & FAQ ────────────────────────────────────────────────────────────────
@@ -343,6 +345,7 @@ class Campaign(Base, TimestampMixin):
     clicked_count = Column(Integer, default=0)
 
     tenant = relationship("Tenant", back_populates="campaigns")
+    messages = relationship("Message", back_populates="campaign")
 
 
 # ─── Subscriptions ───────────────────────────────────────────────────────────

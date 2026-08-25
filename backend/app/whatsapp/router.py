@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -11,13 +12,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.database.session import get_db
 from app.database.models import (
-    WhatsAppAccount, Contact, Conversation, Message,
+    WhatsAppAccount, Contact, Conversation, Message, Campaign,
     ConversationStatus, MessageDirection, MessageStatus
 )
 from app.auth.dependencies import get_current_user, require_admin_or_owner
 from app.database.models import User
 
 router = APIRouter(prefix="/whatsapp", tags=["whatsapp"])
+logger = logging.getLogger(__name__)
 
 
 # ─── Webhook verification ─────────────────────────────────────────────────────
@@ -28,9 +30,32 @@ async def verify_webhook(
     hub_verify_token: str = Query(alias="hub.verify_token"),
     hub_challenge: str = Query(alias="hub.challenge"),
 ):
-    if hub_mode == "subscribe" and hub_verify_token == settings.WHATSAPP_VERIFY_TOKEN:
-        return int(hub_challenge)
+    if hub_mode == "subscribe" and hmac.compare_digest(hub_verify_token, settings.WHATSAPP_VERIFY_TOKEN):
+        try:
+            return int(hub_challenge)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Verification failed.")
     raise HTTPException(status_code=403, detail="Verification failed.")
+
+
+def verify_webhook_signature(body: bytes, signature_header: str) -> bool:
+    """Verify Meta's X-Hub-Signature-256 HMAC over the raw request body."""
+    if not settings.WHATSAPP_APP_SECRET:
+        # No app secret configured — only tolerated outside production. Fail closed otherwise.
+        if settings.DEBUG:
+            logger.warning("WHATSAPP_APP_SECRET is not set; skipping webhook signature verification (DEBUG mode).")
+            return True
+        logger.error("WHATSAPP_APP_SECRET is not set; rejecting webhook.")
+        return False
+
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+
+    expected = hmac.new(
+        settings.WHATSAPP_APP_SECRET.encode(), body, hashlib.sha256
+    ).hexdigest()
+    received = signature_header.removeprefix("sha256=")
+    return hmac.compare_digest(expected, received)
 
 
 # ─── Webhook receiver ─────────────────────────────────────────────────────────
@@ -39,9 +64,9 @@ async def verify_webhook(
 async def receive_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     body = await request.body()
 
-    # Signature verification
     signature = request.headers.get("X-Hub-Signature-256", "")
-    # In production, verify against app secret
+    if not verify_webhook_signature(body, signature):
+        raise HTTPException(status_code=403, detail="Invalid webhook signature.")
 
     payload = json.loads(body)
     await process_webhook_payload(payload, db)
@@ -75,6 +100,30 @@ async def process_webhook_payload(payload: dict, db: AsyncSession):
                 await handle_status_update(status_update, db)
 
     await db.commit()
+
+
+async def is_within_conversation_limit(tenant_id, db: AsyncSession) -> bool:
+    """Whether the tenant can still open a new conversation this billing period."""
+    from datetime import datetime, timedelta
+    from sqlalchemy import func
+    from app.database.models import Subscription
+
+    sub_result = await db.execute(
+        select(Subscription).where(Subscription.tenant_id == tenant_id)
+    )
+    sub = sub_result.scalar_one_or_none()
+    if not sub:
+        return True  # no subscription record — fail open, matches agent-limit behavior
+
+    period_start = sub.current_period_start or (datetime.utcnow() - timedelta(days=30))
+
+    count = await db.scalar(
+        select(func.count(Conversation.id)).where(
+            Conversation.tenant_id == tenant_id,
+            Conversation.created_at >= period_start,
+        )
+    )
+    return (count or 0) < sub.max_conversations_per_month
 
 
 async def handle_incoming_message(msg: dict, wa_account: WhatsAppAccount, db: AsyncSession):
@@ -112,6 +161,12 @@ async def handle_incoming_message(msg: dict, wa_account: WhatsAppAccount, db: As
     )
     conversation = result.scalar_one_or_none()
     if not conversation:
+        if not await is_within_conversation_limit(wa_account.tenant_id, db):
+            logger.warning(
+                f"Tenant {wa_account.tenant_id} hit its monthly conversation limit; "
+                f"dropping new conversation from {from_phone}."
+            )
+            return
         conversation = Conversation(
             tenant_id=wa_account.tenant_id,
             contact_id=contact.id,
@@ -174,6 +229,23 @@ async def handle_status_update(status_update: dict, db: AsyncSession):
         msg = result.scalar_one_or_none()
         if msg:
             msg.status = status_map[new_status]
+            if msg.campaign_id:
+                await bump_campaign_status_count(msg.campaign_id, status_map[new_status], db)
+
+
+async def bump_campaign_status_count(campaign_id, status: MessageStatus, db: AsyncSession):
+    """Roll a delivery-status webhook update up into the campaign's counters."""
+    field = {
+        MessageStatus.DELIVERED: "delivered_count",
+        MessageStatus.READ: "read_count",
+        MessageStatus.FAILED: "failed_count",
+    }.get(status)
+    if not field:
+        return
+    campaign = await db.get(Campaign, campaign_id)
+    if not campaign:
+        return
+    setattr(campaign, field, (getattr(campaign, field) or 0) + 1)
 
 
 # ─── Send message API ─────────────────────────────────────────────────────────
@@ -241,6 +313,27 @@ async def create_whatsapp_account(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin_or_owner),
 ):
+    from app.database.models import Subscription
+
+    sub_result = await db.execute(
+        select(Subscription).where(Subscription.tenant_id == current_user.tenant_id)
+    )
+    sub = sub_result.scalar_one_or_none()
+
+    count_result = await db.execute(
+        select(WhatsAppAccount).where(
+            WhatsAppAccount.tenant_id == current_user.tenant_id,
+            WhatsAppAccount.is_active == True,
+        )
+    )
+    current_count = len(count_result.scalars().all())
+
+    if sub and current_count >= sub.max_whatsapp_numbers:
+        raise HTTPException(
+            status_code=403,
+            detail=f"WhatsApp number limit reached ({sub.max_whatsapp_numbers}). Please upgrade your plan.",
+        )
+
     account = WhatsAppAccount(
         tenant_id=current_user.tenant_id,
         **payload.model_dump(),

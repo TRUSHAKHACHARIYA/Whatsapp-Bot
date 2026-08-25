@@ -33,7 +33,10 @@ def send_campaign_broadcast(self, campaign_id: str):
     """
     async def _run():
         from app.database.session import AsyncSessionLocal
-        from app.database.models import Campaign, CampaignStatus, Contact, WhatsAppAccount
+        from app.database.models import (
+            Campaign, CampaignStatus, Contact, WhatsAppAccount,
+            Conversation, ConversationStatus, Message, MessageDirection, MessageStatus,
+        )
         from app.whatsapp.router import send_whatsapp_message
         from sqlalchemy import select
 
@@ -94,13 +97,50 @@ def send_campaign_broadcast(self, campaign_id: str):
                             ],
                         }]
 
-                    await send_whatsapp_message(
+                    response = await send_whatsapp_message(
                         wa_account.phone_number_id,
                         wa_account.access_token,
                         contact.phone,
                         "template",
                         template_payload,
                     )
+                    wa_message_id = (response.get("messages") or [{}])[0].get("id")
+
+                    # Find or create the conversation this broadcast message belongs to,
+                    # so it shows up in the inbox and status webhooks can be tracked.
+                    conv_result = await db.execute(
+                        select(Conversation).where(
+                            Conversation.tenant_id == campaign.tenant_id,
+                            Conversation.contact_id == contact.id,
+                        )
+                    )
+                    conversation = conv_result.scalar_one_or_none()
+                    if not conversation:
+                        conversation = Conversation(
+                            tenant_id=campaign.tenant_id,
+                            contact_id=contact.id,
+                            whatsapp_account_id=wa_account.id,
+                            status=ConversationStatus.OPEN,
+                            bot_active=True,
+                        )
+                        db.add(conversation)
+                        await db.flush()
+
+                    preview = f"[Campaign: {campaign.name}] {campaign.template_name}"
+                    db.add(Message(
+                        conversation_id=conversation.id,
+                        tenant_id=campaign.tenant_id,
+                        campaign_id=campaign.id,
+                        direction=MessageDirection.OUTBOUND,
+                        message_type="template",
+                        content=preview,
+                        template_name=campaign.template_name,
+                        status=MessageStatus.SENT,
+                        wa_message_id=wa_message_id,
+                    ))
+                    conversation.last_message_at = datetime.utcnow()
+                    conversation.last_message_preview = preview[:100]
+
                     sent += 1
 
                     # Small delay to respect WhatsApp rate limits

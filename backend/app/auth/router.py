@@ -1,10 +1,14 @@
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel, EmailStr
 import re
 
 from app.database.session import get_db
+from app.database.models import User, Tenant
 from app.auth import service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -101,7 +105,8 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
             detail="Invalid credentials or tenant not found.",
         )
 
-    tenant_result = await db.get(type(user.tenant), user.tenant_id)
+    tenant = await db.get(Tenant, user.tenant_id)
+
     access_token = service.create_access_token(str(user.id), str(user.tenant_id), user.role)
     refresh_token = service.create_refresh_token(str(user.id))
 
@@ -114,6 +119,8 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
             "email": user.email,
             "role": user.role,
             "tenant_id": str(user.tenant_id),
+            "tenant_slug": tenant.slug,
+            "tenant_name": tenant.name,
         },
     )
 
@@ -127,8 +134,6 @@ async def refresh_token(payload: RefreshRequest, db: AsyncSession = Depends(get_
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token.")
 
-    from sqlalchemy import select
-    from app.database.models import User
     result = await db.execute(select(User).where(User.id == data["sub"]))
     user = result.scalar_one_or_none()
     if not user or not user.is_active:
@@ -148,10 +153,6 @@ async def request_password_reset(payload: PasswordResetRequest, db: AsyncSession
 
 @router.post("/password-reset/confirm")
 async def confirm_password_reset(payload: PasswordResetConfirm, db: AsyncSession = Depends(get_db)):
-    from sqlalchemy import select
-    from app.database.models import User
-    from datetime import datetime
-
     result = await db.execute(
         select(User).where(
             User.reset_token == payload.token,

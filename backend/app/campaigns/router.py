@@ -2,14 +2,15 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db
-from app.database.models import Campaign, CampaignStatus, Contact, WhatsAppAccount, User
+from app.database.models import Campaign, CampaignStatus, User
 from app.auth.dependencies import get_current_user, require_admin_or_owner
+from app.core.tasks import send_campaign_broadcast
 
 router = APIRouter(prefix="/campaigns", tags=["campaigns"])
 
@@ -30,90 +31,6 @@ class CampaignUpdate(BaseModel):
     template_name: Optional[str] = None
     scheduled_at: Optional[datetime] = None
     audience_filter: Optional[dict] = None
-
-
-# ─── Audience builder ─────────────────────────────────────────────────────────
-
-async def build_audience(tenant_id: UUID, filters: dict, db: AsyncSession) -> list[Contact]:
-    """Filter contacts based on campaign audience filters."""
-    query = select(Contact).where(
-        Contact.tenant_id == tenant_id,
-        Contact.opted_out == False,
-    )
-
-    tags = filters.get("tags", [])
-    if tags:
-        # PostgreSQL JSON array containment
-        for tag in tags:
-            query = query.where(Contact.tags.contains([tag]))
-
-    result = await db.execute(query)
-    return result.scalars().all()
-
-
-# ─── Background broadcast task ────────────────────────────────────────────────
-
-async def run_broadcast(campaign_id: UUID, db: AsyncSession):
-    """Send broadcast messages to all audience members."""
-    campaign = await db.get(Campaign, campaign_id)
-    if not campaign:
-        return
-
-    campaign.status = CampaignStatus.RUNNING
-    campaign.started_at = datetime.utcnow()
-    await db.commit()
-
-    # Get WhatsApp account for tenant
-    result = await db.execute(
-        select(WhatsAppAccount).where(
-            WhatsAppAccount.tenant_id == campaign.tenant_id,
-            WhatsAppAccount.is_active == True,
-        ).limit(1)
-    )
-    wa_account = result.scalar_one_or_none()
-    if not wa_account:
-        campaign.status = CampaignStatus.PAUSED
-        await db.commit()
-        return
-
-    contacts = await build_audience(campaign.tenant_id, campaign.audience_filter or {}, db)
-    campaign.audience_count = len(contacts)
-
-    from app.whatsapp.router import send_whatsapp_message
-    sent = 0
-    failed = 0
-
-    for contact in contacts:
-        try:
-            template_payload = {
-                "name": campaign.template_name,
-                "language": {"code": campaign.template_language},
-            }
-            if campaign.template_variables:
-                template_payload["components"] = [
-                    {
-                        "type": "body",
-                        "parameters": [{"type": "text", "text": str(v)} for v in campaign.template_variables],
-                    }
-                ]
-
-            await send_whatsapp_message(
-                wa_account.phone_number_id,
-                wa_account.access_token,
-                contact.phone,
-                "template",
-                template_payload,
-            )
-            sent += 1
-        except Exception as e:
-            print(f"[Campaign] Failed to send to {contact.phone}: {e}")
-            failed += 1
-
-    campaign.sent_count = sent
-    campaign.failed_count = failed
-    campaign.status = CampaignStatus.COMPLETED
-    campaign.completed_at = datetime.utcnow()
-    await db.commit()
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -168,7 +85,6 @@ async def create_campaign(
 @router.post("/{campaign_id}/send")
 async def send_campaign(
     campaign_id: UUID,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin_or_owner),
 ):
@@ -178,9 +94,10 @@ async def send_campaign(
     if campaign.status not in [CampaignStatus.DRAFT, CampaignStatus.SCHEDULED]:
         raise HTTPException(status_code=400, detail=f"Cannot send a campaign in {campaign.status} status.")
 
-    # Queue in background
-    background_tasks.add_task(run_broadcast, campaign_id, db)
-    return {"message": "Campaign broadcast started.", "campaign_id": str(campaign_id)}
+    # Hand off to the Celery worker — a broadcast can be thousands of contacts,
+    # which shouldn't run inline in the API's event loop.
+    send_campaign_broadcast.delay(str(campaign_id))
+    return {"message": "Campaign broadcast queued.", "campaign_id": str(campaign_id)}
 
 
 @router.patch("/{campaign_id}")
