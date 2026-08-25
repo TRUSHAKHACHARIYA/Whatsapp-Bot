@@ -7,10 +7,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.session import get_db
-from app.database.models import BotFlow, User
+from app.database.models import BotFlow, User, Tenant
 from app.auth.dependencies import get_current_user, require_admin_or_owner
+from app.bot.templates import BOT_FLOW_TEMPLATES, render_template
 
 router = APIRouter(prefix="/bot", tags=["bot"])
+
+
+class CreateFlowFromTemplate(BaseModel):
+    template_key: str
 
 
 class BotFlowCreate(BaseModel):
@@ -40,6 +45,39 @@ class FlowEdge(BaseModel):
 class SaveFlowPayload(BaseModel):
     nodes: list[FlowNode]
     edges: list[FlowEdge]
+
+
+@router.get("/templates")
+async def list_templates(current_user: User = Depends(get_current_user)):
+    """Predefined starting flows a business can pick during onboarding."""
+    return [
+        {"key": t["key"], "name": t["name"], "description": t["description"]}
+        for t in BOT_FLOW_TEMPLATES.values()
+    ]
+
+
+@router.post("/flows/from-template", status_code=201)
+async def create_flow_from_template(
+    payload: CreateFlowFromTemplate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin_or_owner),
+):
+    """Create a new (inactive) flow pre-filled from a predefined template."""
+    if payload.template_key not in BOT_FLOW_TEMPLATES:
+        raise HTTPException(status_code=404, detail="Unknown template.")
+
+    tenant = await db.get(Tenant, current_user.tenant_id)
+    template = BOT_FLOW_TEMPLATES[payload.template_key]
+    flow = BotFlow(
+        tenant_id=current_user.tenant_id,
+        name=template["name"],
+        flow_data=render_template(payload.template_key, tenant.name if tenant else ""),
+        is_active=False,
+    )
+    db.add(flow)
+    await db.commit()
+    await db.refresh(flow)
+    return {"id": str(flow.id), "name": flow.name}
 
 
 @router.get("/flows")

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import (
     BotFlow, FAQ, Contact, Conversation, WhatsAppAccount,
-    Message, MessageDirection, MessageStatus
+    Message, MessageDirection, MessageStatus, Lead, LeadStage,
 )
 from app.whatsapp.router import send_whatsapp_message
 
@@ -58,7 +58,10 @@ async def process_message(
         return
 
     # Route based on current node or find entry point
-    matched = await route_flow(content_lower, nodes, current_node_id, conversation, contact, wa_account, db)
+    matched = await route_flow(
+        content_lower, nodes, current_node_id, conversation, contact, wa_account, db,
+        raw_content=content.strip(),
+    )
     if not matched:
         await send_fallback(wa_account, contact.phone)
         await save_outbound_message(
@@ -96,6 +99,7 @@ async def route_flow(
     contact: Contact,
     wa_account: WhatsAppAccount,
     db: AsyncSession,
+    raw_content: str | None = None,
 ) -> bool:
     """Route the conversation through bot flow nodes."""
 
@@ -133,7 +137,42 @@ async def route_flow(
                             await execute_node(target_node, nodes, conversation, contact, wa_account, db)
                             return True
 
+        # Waiting on a free-text reply to a collect_info prompt — capture it as a lead
+        if current_node and current_node.get("type") == "collect_info":
+            await capture_lead_info(raw_content or content, current_node, conversation, contact, wa_account, db)
+            return True
+
     return False
+
+
+async def capture_lead_info(
+    answer: str,
+    node: dict,
+    conversation: Conversation,
+    contact: Contact,
+    wa_account: WhatsAppAccount,
+    db: AsyncSession,
+):
+    """Store the free-text reply to a collect_info prompt as a new lead."""
+    lead = Lead(
+        tenant_id=wa_account.tenant_id,
+        contact_id=contact.id,
+        stage=LeadStage.NEW,
+        source="whatsapp_bot",
+        notes=answer,
+    )
+    db.add(lead)
+
+    data = node.get("data", {})
+    confirmation = data.get(
+        "confirmation",
+        "Thanks! We've received your details and will get back to you shortly. Reply *menu* for other options.",
+    )
+    await send_text(wa_account, contact.phone, confirmation)
+    await save_outbound_message(conversation, wa_account, confirmation, db)
+
+    # Return to the top-level menu context for the next message
+    update_conversation_node(conversation, None)
 
 
 async def execute_node(node: dict, nodes: list, conversation: Conversation, contact: Contact, wa_account: WhatsAppAccount, db: AsyncSession):
