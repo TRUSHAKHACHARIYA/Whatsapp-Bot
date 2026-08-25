@@ -102,6 +102,30 @@ async def process_webhook_payload(payload: dict, db: AsyncSession):
     await db.commit()
 
 
+async def is_within_conversation_limit(tenant_id, db: AsyncSession) -> bool:
+    """Whether the tenant can still open a new conversation this billing period."""
+    from datetime import datetime, timedelta
+    from sqlalchemy import func
+    from app.database.models import Subscription
+
+    sub_result = await db.execute(
+        select(Subscription).where(Subscription.tenant_id == tenant_id)
+    )
+    sub = sub_result.scalar_one_or_none()
+    if not sub:
+        return True  # no subscription record — fail open, matches agent-limit behavior
+
+    period_start = sub.current_period_start or (datetime.utcnow() - timedelta(days=30))
+
+    count = await db.scalar(
+        select(func.count(Conversation.id)).where(
+            Conversation.tenant_id == tenant_id,
+            Conversation.created_at >= period_start,
+        )
+    )
+    return (count or 0) < sub.max_conversations_per_month
+
+
 async def handle_incoming_message(msg: dict, wa_account: WhatsAppAccount, db: AsyncSession):
     from_phone = msg.get("from")
     wa_msg_id = msg.get("id")
@@ -137,6 +161,12 @@ async def handle_incoming_message(msg: dict, wa_account: WhatsAppAccount, db: As
     )
     conversation = result.scalar_one_or_none()
     if not conversation:
+        if not await is_within_conversation_limit(wa_account.tenant_id, db):
+            logger.warning(
+                f"Tenant {wa_account.tenant_id} hit its monthly conversation limit; "
+                f"dropping new conversation from {from_phone}."
+            )
+            return
         conversation = Conversation(
             tenant_id=wa_account.tenant_id,
             contact_id=contact.id,
@@ -283,6 +313,27 @@ async def create_whatsapp_account(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_admin_or_owner),
 ):
+    from app.database.models import Subscription
+
+    sub_result = await db.execute(
+        select(Subscription).where(Subscription.tenant_id == current_user.tenant_id)
+    )
+    sub = sub_result.scalar_one_or_none()
+
+    count_result = await db.execute(
+        select(WhatsAppAccount).where(
+            WhatsAppAccount.tenant_id == current_user.tenant_id,
+            WhatsAppAccount.is_active == True,
+        )
+    )
+    current_count = len(count_result.scalars().all())
+
+    if sub and current_count >= sub.max_whatsapp_numbers:
+        raise HTTPException(
+            status_code=403,
+            detail=f"WhatsApp number limit reached ({sub.max_whatsapp_numbers}). Please upgrade your plan.",
+        )
+
     account = WhatsAppAccount(
         tenant_id=current_user.tenant_id,
         **payload.model_dump(),

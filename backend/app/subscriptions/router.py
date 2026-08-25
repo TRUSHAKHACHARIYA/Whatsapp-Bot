@@ -187,7 +187,7 @@ async def verify_payment(
         hashlib.sha256,
     ).hexdigest()
 
-    if generated != payload.razorpay_signature:
+    if not hmac.compare_digest(generated, payload.razorpay_signature):
         raise HTTPException(status_code=400, detail="Payment signature verification failed.")
 
     result = await db.execute(
@@ -245,7 +245,7 @@ async def razorpay_webhook(request: Request, db: AsyncSession = Depends(get_db))
         hashlib.sha256,
     ).hexdigest()
 
-    if expected != signature:
+    if not signature or not hmac.compare_digest(expected, signature):
         raise HTTPException(status_code=400, detail="Invalid webhook signature.")
 
     import json
