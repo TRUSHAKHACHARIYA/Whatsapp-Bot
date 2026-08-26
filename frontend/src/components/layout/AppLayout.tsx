@@ -43,13 +43,13 @@ const NAV = [
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const { user, isAuthenticated, logout } = useAuthStore();
+  const { user, isAuthenticated, hasHydrated, logout } = useAuthStore();
 
   useEffect(() => {
-    if (!isAuthenticated) router.push("/login");
-  }, [isAuthenticated, router]);
+    if (hasHydrated && !isAuthenticated) router.push("/login");
+  }, [hasHydrated, isAuthenticated, router]);
 
-  if (!isAuthenticated || !user) return null;
+  if (!hasHydrated || !isAuthenticated || !user) return null;
 
   const { bg, text } = avatarColor(user.name);
 

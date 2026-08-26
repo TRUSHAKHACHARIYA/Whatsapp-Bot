@@ -18,10 +18,12 @@ interface AuthState {
   access_token: string | null;
   refresh_token: string | null;
   isAuthenticated: boolean;
+  hasHydrated: boolean;
 
   login: (user: AuthUser, access_token: string, refresh_token: string) => void;
   logout: () => void;
   updateUser: (updates: Partial<AuthUser>) => void;
+  setHasHydrated: (value: boolean) => void;
 }
 
 export const useAuthStore = create<AuthState>()(
@@ -31,6 +33,7 @@ export const useAuthStore = create<AuthState>()(
       access_token: null,
       refresh_token: null,
       isAuthenticated: false,
+      hasHydrated: false,
 
       login: (user, access_token, refresh_token) => {
         localStorage.setItem("access_token", access_token);
@@ -48,6 +51,8 @@ export const useAuthStore = create<AuthState>()(
         set((state) => ({
           user: state.user ? { ...state.user, ...updates } : null,
         })),
+
+      setHasHydrated: (value) => set({ hasHydrated: value }),
     }),
     {
       name: "wapisend-auth",
@@ -57,6 +62,12 @@ export const useAuthStore = create<AuthState>()(
         refresh_token: state.refresh_token,
         isAuthenticated: state.isAuthenticated,
       }),
+      // AppLayout must not redirect to /login on the pre-hydration default
+      // state (isAuthenticated: false) before the persisted session has
+      // actually loaded from localStorage — this flag gates that check.
+      onRehydrateStorage: () => (state) => {
+        state?.setHasHydrated(true);
+      },
     }
   )
 );

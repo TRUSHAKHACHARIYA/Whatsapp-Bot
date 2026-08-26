@@ -83,7 +83,7 @@ export default function DashboardPage() {
         />
         <StatCard
           label="New Leads"
-          value={stats?.leads?.new || "—"}
+          value={stats?.leads?.new ?? "—"}
           delta="+24% this month"
           trend="up"
           icon={<UserPlus size={16} />}
